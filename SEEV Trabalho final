@@ -1,0 +1,306 @@
+//Nome ALUNO A- Nuno António
+//Numero ALUNO A- 2181030
+//Nome ALUNO B- Duarte Carreira
+//Numero ALUNO B- 2181240
+//IPLEIRIA - Instituto Politécnico de Leiria
+//ESTG - Escola Superior de Tecnologia e Gestão
+//LEAU- Licenciatura em Engenharia Automóvel
+//SEEV - Sistemas Elétricos e Eletrónicos de Veículos
+
+// Bibliotecas -----
+
+#include "Arduino.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_task_wdt.h"
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+//SENSOR DE TEMPERATURA
+#include <DHT.h>
+#include <Adafruit_Sensor.h>
+#include <DHT_U.h>
+
+// ServoMotor
+#include <Servo_ESP32.h>
+
+//LCD
+#include "SPI.h"
+#include "TFT_eSPI.h"
+#include <TFT_eSPI.h> // Graphics and font library for ILI9341 driver chip
+#include <SPI.h>
+#include <Wire.h>
+
+TFT_eSPI tft = TFT_eSPI();  // Invoke library
+
+// Variáveris de iniciação (defines) ----
+//SENSOR DE TEMPERATURA
+#define DHT_SENSOR_PIN  25 // ESP32 pin GIOP27 connected to DHT11 sensor
+#define DHT_SENSOR_TYPE DHT11 //type sensor
+
+// Botao para interromper o sistema ---
+#define BOT_UP_PIN 16
+
+//LCD
+#define TFT_GREY 0x5AEB // New colour
+
+// ---------------------------------------------------------------------------
+SemaphoreHandle_t xSemaphore = NULL;
+static void IRAM_ATTR vBotUPInterruptHandler( void );
+// ---------------------------------------------------------------------------
+
+SemaphoreHandle_t xSemaphore_LCD = NULL;
+
+// Cabeçalho ---                               /---AQUI---/
+void vTask_BRAIN (void *pvParameters);
+void vTask_DHT11 (void *pvParameters);
+void vTask_SERVO (void *pvParameters);
+void vTask_LCD ( void *pvParameters );
+
+
+// Handler das funções ---
+
+QueueHandle_t xQueue_DHT11_PRA_BRAIN;
+QueueHandle_t xQueue_DHT11_PRA_LCD;
+
+
+TaskHandle_t vTask_DHT11Handle;
+TaskHandle_t vTask_SERVOHandle;
+TaskHandle_t vTask_LCDHandle;
+
+float Temp_do_DHT11;
+
+// --> Pin do Servo
+static const int servoPin = 14; //printed G14 on the board
+Servo_ESP32 servo1;
+
+
+/* SETUP ------------------------------------------------------------------------------------------------------------------------------------------*/
+void setup() {
+
+  // Set loopTask max priority before deletion
+  vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+
+  // Init USART and set Baud-rate to 115200
+  Serial.begin(115200);
+  while (!Serial);
+
+  // ---------------------------------------------------------------------------
+  xSemaphore = xSemaphoreCreateBinary();
+  pinMode(BOT_UP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BOT_UP_PIN), &vBotUPInterruptHandler, FALLING);
+  // ---------------------------------------------------------------------------
+
+  xSemaphore_LCD = xSemaphoreCreateBinary();
+
+
+  xQueue_DHT11_PRA_LCD = xQueueCreate( 1, sizeof( float ) );
+  xQueue_DHT11_PRA_BRAIN = xQueueCreate( 1, sizeof( float ) );
+
+
+
+  xTaskCreatePinnedToCore( vTask_BRAIN, "vTask_BRAIN", 1024, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore( vTask_DHT11, "vTask_DHT11", 1024, NULL, 2, &vTask_DHT11Handle, 1);
+  xTaskCreatePinnedToCore( vTask_SERVO, "vTask_SERVO", 1024, NULL, 1, &vTask_SERVOHandle, 1);
+  xTaskCreatePinnedToCore( vTask_LCD,   "vTask_LCD",   1024, NULL, 1, &vTask_LCDHandle, 1);
+
+
+
+}
+
+/* DHT 11 ------------------------------------------------------------------------------------------------------------------------------------------*/
+void vTask_DHT11 (void *pvParameters) {
+
+  float Temp_do_DHT11;
+  const TickType_t xTicksToWait = 1000 / portTICK_PERIOD_MS;
+  portBASE_TYPE xStatus_pra_brain;
+  portBASE_TYPE xStatus;
+
+
+  DHT dht_sensor(DHT_SENSOR_PIN, DHT_SENSOR_TYPE);
+  dht_sensor.begin(); // Inicializar o DHT sensor
+
+  //Temp_do_DHT11 = dht_sensor.readTemperature();
+
+  for (;;) {
+
+    Temp_do_DHT11 = dht_sensor.readTemperature();
+
+    xStatus_pra_brain = xQueueSendToBack( xQueue_DHT11_PRA_BRAIN, &Temp_do_DHT11, xTicksToWait);
+    xStatus = xQueueSendToBack(xQueue_DHT11_PRA_LCD, &Temp_do_DHT11, xTicksToWait);
+
+
+    /*Serial.print("O valor do sensor recebido (vTask_DHT11): ");
+      Serial.print(Temp_do_DHT11);
+      Serial.print(" ºC");
+      Serial.print("\n");*/
+
+    if ( xStatus_pra_brain != pdPASS ) {
+
+      // ERRO
+      /*Serial.print("ERRO NA QUEUE DO DHT 11 (Para a Brain)");
+        Serial.print("\n");*/
+
+    }
+
+  }
+
+  taskYIELD();
+
+  //vTaskDelay(xTicksToWait);
+}
+
+/* BRAIN ------------------------------------------------------------------------------------------------------------------------------------------*/
+// DICA: UTILIZAS PARA O BOTÃO DE EMERGENCIA * FUNCIONA
+
+void vTask_BRAIN (void *pvParameters) {
+
+  const TickType_t xTicksToWait = 1000 / portTICK_PERIOD_MS;
+  float VALOR_RECEBIDO_DO_DHT11;
+  portBASE_TYPE xStatus_pra_brain;
+  portBASE_TYPE xStatus_pra_servo;
+  portBASE_TYPE xStatus;
+
+
+  vTaskSuspend(vTask_SERVOHandle);
+
+  for (;;) {
+
+    xStatus_pra_brain = xQueueReceive( xQueue_DHT11_PRA_BRAIN, &VALOR_RECEBIDO_DO_DHT11, xTicksToWait);
+
+    if ( xStatus_pra_brain == pdPASS ) {
+
+      Serial.print("O valor do sensor recebido (vTask_BRAIN): ");
+      Serial.print(VALOR_RECEBIDO_DO_DHT11);
+      Serial.print(" ºC");
+      Serial.print("\n");
+
+      if (VALOR_RECEBIDO_DO_DHT11 > 27) {
+
+        vTaskResume(vTask_SERVOHandle);
+
+      }
+
+      else {
+
+        vTaskSuspend(vTask_SERVOHandle);
+
+      }
+
+      // ACHO QUE NÃO PRECISO ---
+      xStatus = pdPASS;
+      while (xStatus == pdPASS) {
+        xStatus = xSemaphoreTake(xSemaphore, xTicksToWait);
+        if ( xStatus == pdPASS ) {
+        }
+        yield();
+      }
+    }
+
+    taskYIELD();
+
+    //vTaskDelay(xTicksToWait);
+
+  }
+}
+/* SERVO ------------------------------------------------------------------------------------------------------------------------------------------*/
+void vTask_SERVO (void *pvParameters) {
+
+  int angle = 0;
+  int angleStep = 5;
+  int angleMin = 0;
+  int angleMax = 180;
+
+  const TickType_t xTicksToWait = 100 / portTICK_PERIOD_MS;
+  float VALOR_RECEBIDO_DA_BRAIN;
+  float VALOR_RECEBIDO_DO_DHT11;
+  portBASE_TYPE xStatus_pra_servo;
+
+  servo1.attach(servoPin);
+
+  for (;;) {
+
+    for (int angle = 0; angle <= angleMax; angle += angleStep) {
+      servo1.write(angle);
+      //Serial.println(angle);
+      vTaskDelay(xTicksToWait);
+    }
+
+    for (int angle = 180; angle >= angleMin; angle -= angleStep) {
+      servo1.write(angle);
+      //Serial.println(angle);
+      vTaskDelay(xTicksToWait);
+    }
+
+
+  }
+
+  //vTaskDelay(xTicksToWait);
+
+}
+
+/* BotUPInterrup ------------------------------------------------------------------------------------------------------------------------------------------*/
+
+static void IRAM_ATTR vBotUPInterruptHandler( void ) {
+  static portBASE_TYPE xHigherPriorityTaskWoken;
+  xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR( xSemaphore, (BaseType_t*)&xHigherPriorityTaskWoken );
+  Serial.println( "INTERRUPT ...." );
+
+  tft.setTextColor(TFT_YELLOW);
+  tft.setTextFont(3);
+  tft.println("Interrupcao");
+  tft.init();
+
+  if ( xHigherPriorityTaskWoken == pdTRUE )
+  {
+    portYIELD_FROM_ISR();
+    //vPortYield();
+  }
+}
+
+/* LCD ------------------------------------------------------------------------------------------------------------------------------------------*/
+
+void vTask_LCD( void *pvParameters ) {
+
+  const TickType_t xTicksToWait = 1000 / portTICK_PERIOD_MS;
+  portBASE_TYPE xStatus;
+  float recebido;
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_GREY);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(3);
+
+  for ( ;; ) {
+
+    xSemaphoreTake(xSemaphore_LCD, 0);
+    xStatus = xQueueReceive(xQueue_DHT11_PRA_LCD, &recebido, xTicksToWait); // Penso que esta no 0 em vez de xTicksToWait
+
+
+    if ( xStatus == pdPASS ) {
+
+
+      // LCD
+      tft.setCursor(0, 0, 2);
+      tft.println("Temperatura:"); 
+      tft.println(recebido);
+
+    }
+
+  }
+  xSemaphoreGive(xSemaphore_LCD);
+
+}
+
+/* LOOP ------------------------------------------------------------------------------------------------------------------------------------------*/
+void loop() {
+
+  vTaskDelete( NULL );
+
+}
